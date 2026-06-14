@@ -30,10 +30,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-TRAIN_INPUT=""
-TEST_INPUT=""
+TRAIN_INPUT="/kaggle/input/datasets/mustafaalkhafaji95/clic-dataset/val2017"
+TEST_INPUT="/kaggle/input/datasets/khitrnminh/kodak-test"
 INPUT_PARENT=""
-OUTPUT_DIR=""
+OUTPUT_DIR="/kaggle/working/walloc/results"
 GPUS="all"
 DO_INSTALL=1
 WANDB="disabled"
