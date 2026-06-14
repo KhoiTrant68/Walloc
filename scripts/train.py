@@ -142,9 +142,9 @@ def train_one_epoch(net, criterion, loader, opt, aux_opt, epoch, clip,
         tb.add_scalar("train/loss", out["loss"].item(), gs)
         tb.add_scalar("train/bpp", out["bpp_loss"].item(), gs)
         tb.add_scalar("train/mse", out["mse_loss"].item(), gs)
-        tb.add_scalar("train/psnr", float(psnr(out["mse_loss"])), gs)
+        tb.add_scalar("train/psnr", psnr(out["mse_loss"].detach()).item(), gs)
         tb.add_scalar("train/perc", out["perc_loss"].item(), gs)
-        tb.add_scalar("train/aux", float(aux), gs)
+        tb.add_scalar("train/aux", aux.detach().item() if torch.is_tensor(aux) else float(aux), gs)
         tb.add_scalar("train/lr", opt.param_groups[0]["lr"], gs)
         global_step[0] = gs + 1
 
