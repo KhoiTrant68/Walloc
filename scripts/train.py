@@ -387,26 +387,26 @@ def main(argv=None):
         ntc = pretrained_models["cheng2020-attn"](
             quality=ntc_q, metric="mse", pretrained=True, progress=False
         )
-        skip = {
-            "gaussian_conditional._offset",
-            "gaussian_conditional._quantized_cdf",
-            "gaussian_conditional._cdf_length",
-            "gaussian_conditional.scale_table",
-        }
-        # Drop keys with shape mismatch — best-effort warm start. This is
-        # what lets `--channels` be anything (not just 128/192) without
-        # crashing the load.
+        # Range-coder buffers (CDFs/offsets) come from net.update() after
+        # training, so we ignore the pretrained values. But we still need
+        # them PRESENT in the dict — CompressionModel.load_state_dict runs
+        # update_registered_buffers first and KeyErrors otherwise. So:
+        # filter by shape mismatch, but keep all keys.
         tgt = net.state_dict()
         sd = {}
         n_drop_shape = 0
         for k, v in ntc.state_dict().items():
-            if k in skip:
-                continue
             if k in tgt and tgt[k].shape != v.shape:
                 n_drop_shape += 1
                 continue
             sd[k] = v
-        missing, unexpected = net.load_state_dict(sd, strict=False)
+        # Bypass CompressionModel.load_state_dict (which calls
+        # update_registered_buffers and demands every buffer key be present)
+        # by going straight to nn.Module. The buffers will be rebuilt
+        # correctly when the user calls net.update() before deployment.
+        missing, unexpected = torch.nn.Module.load_state_dict(
+            net, sd, strict=False,
+        )
         print(f"[init] loaded={len(sd)} missing={len(missing)} "
               f"unexpected={len(unexpected)} dropped_shape_mismatch={n_drop_shape}")
 
