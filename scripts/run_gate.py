@@ -38,19 +38,25 @@ from scripts.data import autodetect_dataset  # noqa: E402
 # --------------------------------------------------------------------- #
 
 
-def gate_matrix(lmbda: float) -> List[Dict]:
-    """6 critical runs + 1 ablation that decide the gate."""
+def gate_matrix(args) -> List[Dict]:
+    """6 critical runs + 1 ablation that decide the gate.
+
+    Per-mode lmbda is essential: at a shared lmbda, PD and det land at
+    LOWER bpp than SD (PD/det entropy is lower at the same distortion
+    weight), confounding SW2 comparison with rate. We pre-set lmbda so
+    bpp is roughly matched. Calibrate from the first run if needed.
+    """
     return [
-        # baselines (lambda_p = 0)
-        {"tag": "sd_lp0",        "mode": "sd",  "lp": 0.0, "s": 1.0},
-        {"tag": "pd_lp0_s125",   "mode": "pd",  "lp": 0.0, "s": 1.25},
-        # perception ramp
-        {"tag": "sd_lp_lo",      "mode": "sd",  "lp": 0.5, "s": 1.0},
-        {"tag": "sd_lp_hi",      "mode": "sd",  "lp": 2.0, "s": 1.0},
-        {"tag": "pd_lp_lo_s125", "mode": "pd",  "lp": 0.5, "s": 1.25},
-        {"tag": "pd_lp_hi_s125", "mode": "pd",  "lp": 2.0, "s": 1.25},
-        # ablation: deterministic cannot reach the perception floor SD/PD can.
-        {"tag": "det_lp_hi",     "mode": "det", "lp": 2.0, "s": 1.0},
+        # SD anchor + perception ramp
+        {"tag": "sd_lp0",        "mode": "sd",  "lp": 0.0, "s": 1.0,  "lmbda": args.lmbda_sd},
+        {"tag": "sd_lp_lo",      "mode": "sd",  "lp": 0.5, "s": 1.0,  "lmbda": args.lmbda_sd},
+        {"tag": "sd_lp_hi",      "mode": "sd",  "lp": 2.0, "s": 1.0,  "lmbda": args.lmbda_sd},
+        # PD anchor + perception ramp (lmbda lowered to match SD bpp)
+        {"tag": "pd_lp0_s125",   "mode": "pd",  "lp": 0.0, "s": 1.25, "lmbda": args.lmbda_pd},
+        {"tag": "pd_lp_lo_s125", "mode": "pd",  "lp": 0.5, "s": 1.25, "lmbda": args.lmbda_pd},
+        {"tag": "pd_lp_hi_s125", "mode": "pd",  "lp": 2.0, "s": 1.25, "lmbda": args.lmbda_pd},
+        # Ablation: deterministic cannot reach the SD/PD perception floor.
+        {"tag": "det_lp_hi",     "mode": "det", "lp": 2.0, "s": 1.0,  "lmbda": args.lmbda_det},
     ]
 
 
@@ -88,7 +94,7 @@ def train_one(cfg, args, out_root: Path) -> Path:
     cmd = [
         sys.executable, "-u", "scripts/train.py",
         "--dither_mode", cfg["mode"],
-        "--lmbda", str(args.lmbda),
+        "--lmbda", str(cfg["lmbda"]),
         "--lmbda_p", str(cfg["lp"]),
         "--s_dither", str(cfg["s"]),
         "--epochs", str(args.epochs),
@@ -204,6 +210,18 @@ def decide_gate(table: List[Dict]) -> Dict:
     else:
         results["P3_det_cannot_reach_sd_perception"] = None
 
+    # bpp-matched sanity check: SW2 comparison is invalid if rates spread
+    # by more than ~10%. This is methodology, not a kill criterion per se,
+    # but a failed match invalidates P1 and P3.
+    bpps = [r["bpp_mean"] for r in table]
+    if bpps:
+        bpp_spread = (max(bpps) - min(bpps)) / max(min(bpps), 1e-9)
+        results["bpp_matched_within_10pct"] = bpp_spread < 0.10
+        notes.append(
+            f"bpp spread: min={min(bpps):.4f} max={max(bpps):.4f} "
+            f"rel={bpp_spread:.1%} -> {'OK' if bpp_spread < 0.10 else 'INVALID (retune lmbda_pd / lmbda_det)'}"
+        )
+
     results["GATE_PASS"] = all(v for v in results.values() if v is not None)
     results["notes"] = notes
     return results
@@ -233,14 +251,26 @@ def parse_args(argv=None):
     p.add_argument("--data_root", default=os.environ.get("WALLOC_TRAIN_INPUT"))
     p.add_argument("--test_root", default=os.environ.get("WALLOC_TEST_INPUT"))
     # training knobs (passed through to scripts/train.py)
-    p.add_argument("--lmbda", type=float, default=0.013)
-    p.add_argument("--epochs", type=int, default=20)
+    # Per-mode lmbda: PD and det land at LOWER bpp than SD at the same lmbda
+    # (their entropy models are lighter), so we drop lmbda for them. The
+    # defaults below are calibrated on Kodak from the round-1 gate run
+    # (SD@0.013 -> bpp 0.50, PD@0.013 -> bpp 0.40, det@0.013 -> bpp 0.34);
+    # to land all three near bpp 0.50 we need lmbda_pd ~0.0085 and
+    # lmbda_det ~0.0055. Retune if the bpp-matched check still fails.
+    p.add_argument("--lmbda",     type=float, default=None,
+                   help="if set, overrides per-mode lmbdas (back-compat)")
+    p.add_argument("--lmbda_sd",  type=float, default=0.013)
+    p.add_argument("--lmbda_pd",  type=float, default=0.0085)
+    p.add_argument("--lmbda_det", type=float, default=0.0055)
+    p.add_argument("--epochs", type=int, default=12)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--patch_size", type=int, default=256)
-    p.add_argument("--channels", type=int, default=128)
+    p.add_argument("--channels", type=int, default=192)
     p.add_argument("--N_integral", type=int, default=512)
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--ntc_quality", type=int, default=4)
+    p.add_argument("--ntc_quality", type=int, default=4,
+                   help="cheng2020-attn pretrained checkpoint; "
+                        "q=4 (N=192) matches --channels 192 default")
     p.add_argument("--num_gpus", type=int,
                    default=_env_int("WALLOC_NUM_GPUS", 0))
     # orchestration
@@ -255,6 +285,12 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    # Back-compat: --lmbda VALUE applies to all three modes (the old behavior
+    # that produced the bpp-mismatch problem; kept only for legacy invocation).
+    if args.lmbda is not None:
+        print(f"[warn] --lmbda={args.lmbda} overrides per-mode lmbdas; "
+              f"bpp matching will likely fail.")
+        args.lmbda_sd = args.lmbda_pd = args.lmbda_det = args.lmbda
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -266,11 +302,12 @@ def main(argv=None):
         except FileNotFoundError:
             print("[warn] no test set autodetected; eval will fail if not provided")
 
-    matrix = gate_matrix(args.lmbda)
+    matrix = gate_matrix(args)
     if args.runs:
         wanted = set(s.strip() for s in args.runs.split(","))
         matrix = [c for c in matrix if c["tag"] in wanted]
     print(f"[gate] {len(matrix)} runs planned: {[c['tag'] for c in matrix]}")
+    print(f"[gate] lmbda: sd={args.lmbda_sd} pd={args.lmbda_pd} det={args.lmbda_det}")
     print(f"[gate] out_root={out_root}")
     print(f"[gate] data_root={args.data_root}")
     print(f"[gate] test_root={args.test_root}")
