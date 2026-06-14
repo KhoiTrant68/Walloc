@@ -11,3 +11,4 @@ wandb==0.21.1
 tensorboard>=2.14
 geomloss>=0.2.6
 pytorch-msssim>=1.0.0
+torch_geometric>=2.8.0
