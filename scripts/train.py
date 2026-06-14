@@ -373,9 +373,19 @@ def main(argv=None):
 
     if args.load_ntc:
         from compressai.zoo import image_models as pretrained_models
-        print(f"[init] loading NTC cheng2020-attn q={args.ntc_quality}")
+        # CompressAI cheng2020-attn channel mapping:
+        #   q=1..3 -> N=128,  q=4..6 -> N=192
+        # If user-picked quality doesn't match args.channels, bump it.
+        ntc_q = args.ntc_quality
+        if args.channels == 128 and ntc_q > 3:
+            print(f"[init] channels=128 incompatible with q={ntc_q}; using q=3")
+            ntc_q = 3
+        elif args.channels == 192 and ntc_q < 4:
+            print(f"[init] channels=192 incompatible with q={ntc_q}; using q=4")
+            ntc_q = 4
+        print(f"[init] loading NTC cheng2020-attn q={ntc_q}")
         ntc = pretrained_models["cheng2020-attn"](
-            quality=args.ntc_quality, metric="mse", pretrained=True, progress=False
+            quality=ntc_q, metric="mse", pretrained=True, progress=False
         )
         skip = {
             "gaussian_conditional._offset",
@@ -383,9 +393,22 @@ def main(argv=None):
             "gaussian_conditional._cdf_length",
             "gaussian_conditional.scale_table",
         }
-        sd = {k: v for k, v in ntc.state_dict().items() if k not in skip}
+        # Drop keys with shape mismatch — best-effort warm start. This is
+        # what lets `--channels` be anything (not just 128/192) without
+        # crashing the load.
+        tgt = net.state_dict()
+        sd = {}
+        n_drop_shape = 0
+        for k, v in ntc.state_dict().items():
+            if k in skip:
+                continue
+            if k in tgt and tgt[k].shape != v.shape:
+                n_drop_shape += 1
+                continue
+            sd[k] = v
         missing, unexpected = net.load_state_dict(sd, strict=False)
-        print(f"[init] missing={len(missing)} unexpected={len(unexpected)}")
+        print(f"[init] loaded={len(sd)} missing={len(missing)} "
+              f"unexpected={len(unexpected)} dropped_shape_mismatch={n_drop_shape}")
 
     net = net.to(device)
     opts = net_aux_optimizer(
