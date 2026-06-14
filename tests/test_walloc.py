@@ -159,15 +159,22 @@ def test_pd_distortion_decomposition_prop3_3_in_expectation():
 
 
 def test_sliced_w2_matches_gaussian_closed_form():
-    """For N(0, I_d) and N(0, sigma^2 I_d):  W_2^2 = d*(1-sigma)^2.
-    Paper App. E setup uses d=8, sigma=0.5 -> W_2^2 = 2."""
+    """For X ~ N(0, I_d) and Y ~ N(0, sigma^2 I_d), every unit projection
+    theta gives X . theta ~ N(0, 1) and Y . theta ~ N(0, sigma^2) regardless
+    of theta. The 1-D W_2^2 between those is (1 - sigma)^2, so
+
+        SW_2^2(X, Y) = E_theta[ W_2^2(X.theta, Y.theta) ] = (1 - sigma)^2.
+
+    (This is the per-projection W_2^2 our `sliced_w2` returns — NOT the
+    full d-dim Bures W_2^2 which would be d*(1 - sigma)^2.)
+    """
     d, n, sigma = 8, 10_000, 0.5
     X = torch.randn(n, d)
     Y = sigma * torch.randn(n, d)
     estimates = [sliced_w2(X, Y, n_proj=256).item() for _ in range(5)]
     mean = sum(estimates) / len(estimates)
-    truth = d * (1 - sigma) ** 2
-    assert abs(mean - truth) < 0.4, (mean, truth, estimates)
+    truth = (1 - sigma) ** 2  # = 0.25
+    assert abs(mean - truth) < 0.05, (mean, truth, estimates)
 
 
 def test_sliced_w2_zero_on_same_distribution():
@@ -204,26 +211,23 @@ def test_nested_e8_coset_reps_in_voronoi_of_coarse():
 def test_nested_e8_coset_norm_spectrum_a2():
     """Structural sanity on the coset rep spectrum for E8 / 2E8.
 
-    We don't pin the full spectrum (the exact count per shell depends on
-    the choice of canonical rep when multiple reps tie at the same norm).
-    Instead we check load-bearing structural properties:
+    There are |E8 / 2E8| = 2^8 = 256 cosets. Load-bearing properties:
       - the zero vector is present exactly once
-      - all reps have norm <= covering radius of 2E8 = 2
-        (i.e., norm^2 <= 4 + small fp tolerance)
-      - a substantial fraction (>= 200) of reps sit at norm^2 = 2,
-        which is the E8 minimum-distance shell — the bulk of coset reps
-        should be drawn from there since this is the densest sphere.
+      - all reps lie inside V_0(2E8), so norm^2 <= covering radius^2 = 4
+      - exactly 120 reps sit at norm^2 = 2 (E8 minimum shell):
+        E8 has 240 minimum-norm vectors {v_1, ..., v_240}; since
+        -v ≡ v - 2v = v (mod 2E8), each pair {v, -v} collapses to a
+        single coset, giving 240/2 = 120 cosets whose minimum
+        representative has norm^2 = 2.
     """
     net = NestedE8Product(channels=8, a=2)
     norms_sq = net.coset_rep_norms()
     assert norms_sq.shape == (256,)
     n_zero = (norms_sq < 1e-6).sum().item()
     assert n_zero == 1, n_zero
-    # Every rep must lie in V_0(2E8), which has covering radius 2.
-    # Allow small fp slack for boundary points.
     assert norms_sq.max().item() <= 4.0 + 1e-4
     n_min = ((norms_sq > 1.99) & (norms_sq < 2.01)).sum().item()
-    assert n_min >= 200, n_min
+    assert n_min == 120, n_min
 
 
 def test_nested_e8_sampling_is_uniform():
