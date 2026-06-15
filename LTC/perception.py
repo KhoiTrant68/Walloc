@@ -12,11 +12,29 @@ distributional realism, not per-image similarity.
 SW_2^2 is the primary estimator (cheap, matches the proxy used in
 arXiv 2503.17558v2 App. E). Debiased Sinkhorn via `geomloss` is provided as a
 secondary check — useful for the "gap-to-bound" analysis in the writeup.
+
+------------------------------------------------------------------------
+PATCH NOTE (perc_scale): the MSE term is multiplied by 255**2 to match
+CompressAI's convention so `lambda` values are comparable across papers.
+SW_2^2 on patches in [0,1] lives in the SAME [0,1] image space, so to make
+`lambda_p` comparable to `lambda` (both as Lagrange multipliers in the
+same units of pixel-energy), the perception term must be scaled by the
+SAME 255**2 factor.
+
+Without this scaling, lambda_p=2.0 contributed ~1e-4 to a loss whose MSE
+term contributed ~0.4 (a 4000x mismatch) — i.e. perception was effectively
+turned off no matter what lambda_p the user set. We default `perc_scale` to
+255**2 to fix this; pass `perc_scale=1.0` to recover the old behaviour.
+
+WARNING: after this fix, the lambda_p grid that "worked" before is now
+3-4 orders of magnitude too large. Use grids on the order of {0, 0.05, 0.2}
+not {0, 0.5, 2.0}. See run_gate.py.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional
 
 import torch
@@ -107,13 +125,16 @@ def sinkhorn_div(X: Tensor, Y: Tensor, blur: float = 0.05) -> Tensor:
 class RDPLoss(nn.Module):
     """Rate-Distortion-Perception loss:
 
-        L = bpp + lambda * 255^2 * MSE  +  lambda_p * delta(P_x, P_x_hat)
+        L = bpp + lambda * 255^2 * MSE  +  lambda_p * perc_scale * delta(P_x, P_x_hat)
 
     Rate is computed from the model's reported likelihoods (operational
     cross-entropy / num_pixels). Distortion is MSE on [0,1] images, scaled
     by 255^2 to match CompressAI's convention so `lambda` values are
     comparable to standard image-codec literature. Perception is SW_2^2 on
     patches by default; switch to Sinkhorn via `perc='sinkhorn'`.
+
+    `perc_scale` defaults to 255**2 so `lambda_p` is in the SAME units as
+    `lambda`. See module docstring for the rationale.
     """
 
     METRICS = ("sw", "sinkhorn")
@@ -127,6 +148,7 @@ class RDPLoss(nn.Module):
         n_proj: int = 128,
         max_patches: int = 4096,
         sinkhorn_blur: float = 0.05,
+        perc_scale: float = 255.0 ** 2,
     ):
         super().__init__()
         if perc not in self.METRICS:
@@ -138,6 +160,20 @@ class RDPLoss(nn.Module):
         self.n_proj = int(n_proj)
         self.max_patches = int(max_patches)
         self.sinkhorn_blur = float(sinkhorn_blur)
+        self.perc_scale = float(perc_scale)
+        # Sanity warning: a tiny perc_scale with a large lmbda_p almost
+        # certainly means the user forgot to update lmbda_p after the
+        # perc_scale fix. lmbda_p > 0.5 only makes sense when perc_scale
+        # is on the order of 1.0 (legacy un-scaled regime).
+        if self.lmbda_p >= 0.5 and self.perc_scale >= 1000.0:
+            warnings.warn(
+                f"lmbda_p={self.lmbda_p} combined with perc_scale={self.perc_scale} "
+                f"will push the perception term to dominate the loss "
+                f"(contribution >= {self.lmbda_p * self.perc_scale * 5e-5:.2f}). "
+                f"Did you forget to shrink lmbda_p when migrating to the "
+                f"255**2-scaled perception term? See LTC/perception.py docstring.",
+                stacklevel=2,
+            )
         self.mse = nn.MSELoss()
 
     def perception(self, x: Tensor, x_hat: Tensor) -> Tensor:
@@ -165,6 +201,6 @@ class RDPLoss(nn.Module):
         out["loss"] = (
             out["bpp_loss"]
             + self.lmbda * 255.0**2 * out["mse_loss"]
-            + self.lmbda_p * out["perc_loss"]
+            + self.lmbda_p * self.perc_scale * out["perc_loss"]
         )
         return out

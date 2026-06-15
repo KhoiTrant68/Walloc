@@ -13,6 +13,25 @@ skipped (summary.json + eval_kodak.json are the markers).
 
 Picks up env defaults from setup.sh: WALLOC_OUTPUT_DIR, WALLOC_TRAIN_INPUT,
 WALLOC_TEST_INPUT, WALLOC_NUM_GPUS.
+
+------------------------------------------------------------------------
+PATCH NOTES (round-2 calibration after round-1 gate failure):
+
+1) Per-mode lmbda was UPSIDE-DOWN in round 1. The original comment claimed
+   "PD and det land at lower bpp than SD at the same lmbda, so we drop
+   lmbda for them" — but dropping lmbda makes bpp LOWER still. Round-1
+   results confirmed this: det@0.0055 -> 0.16 bpp, pd@0.0085 -> 0.28 bpp,
+   sd@0.013 -> 0.50 bpp. To match SD's ~0.50 bpp anchor, we must
+   INCREASE lmbda for PD and det. New defaults below were chosen to
+   target bpp ~ 0.50 for all three modes; verify with the first round-2
+   run and adjust if the bpp spread is still > 10%.
+
+2) The perception term in RDPLoss is now scaled by 255**2 (see
+   LTC/perception.py docstring). The old lambda_p grid {0, 0.5, 2.0} was
+   ~4000x too weak; perception contributed ~0.02% of the total loss and
+   could not influence training. New grid {0, 0.05, 0.2} brings the
+   perception contribution into the same order as the MSE term at
+   lp_hi.
 """
 
 from __future__ import annotations
@@ -42,21 +61,24 @@ def gate_matrix(args) -> List[Dict]:
     """6 critical runs + 1 ablation that decide the gate.
 
     Per-mode lmbda is essential: at a shared lmbda, PD and det land at
-    LOWER bpp than SD (PD/det entropy is lower at the same distortion
-    weight), confounding SW2 comparison with rate. We pre-set lmbda so
-    bpp is roughly matched. Calibrate from the first run if needed.
+    LOWER bpp than SD; we INCREASE lmbda for PD/det so all three modes
+    land near the same bpp. Calibrate from the first round-2 run if the
+    bpp spread is still > 10%.
+
+    Per-mode lmbda_p: the grid {lp0, lp_lo, lp_hi} is shared across modes
+    so the perception ramp is comparable.
     """
     return [
         # SD anchor + perception ramp
-        {"tag": "sd_lp0",        "mode": "sd",  "lp": 0.0, "s": 1.0,  "lmbda": args.lmbda_sd},
-        {"tag": "sd_lp_lo",      "mode": "sd",  "lp": 0.5, "s": 1.0,  "lmbda": args.lmbda_sd},
-        {"tag": "sd_lp_hi",      "mode": "sd",  "lp": 2.0, "s": 1.0,  "lmbda": args.lmbda_sd},
-        # PD anchor + perception ramp (lmbda lowered to match SD bpp)
-        {"tag": "pd_lp0_s125",   "mode": "pd",  "lp": 0.0, "s": 1.25, "lmbda": args.lmbda_pd},
-        {"tag": "pd_lp_lo_s125", "mode": "pd",  "lp": 0.5, "s": 1.25, "lmbda": args.lmbda_pd},
-        {"tag": "pd_lp_hi_s125", "mode": "pd",  "lp": 2.0, "s": 1.25, "lmbda": args.lmbda_pd},
+        {"tag": "sd_lp0",        "mode": "sd",  "lp": args.lp_zero, "s": 1.0,  "lmbda": args.lmbda_sd},
+        {"tag": "sd_lp_lo",      "mode": "sd",  "lp": args.lp_lo,   "s": 1.0,  "lmbda": args.lmbda_sd},
+        {"tag": "sd_lp_hi",      "mode": "sd",  "lp": args.lp_hi,   "s": 1.0,  "lmbda": args.lmbda_sd},
+        # PD anchor + perception ramp (lmbda raised to match SD bpp)
+        {"tag": "pd_lp0_s125",   "mode": "pd",  "lp": args.lp_zero, "s": 1.25, "lmbda": args.lmbda_pd},
+        {"tag": "pd_lp_lo_s125", "mode": "pd",  "lp": args.lp_lo,   "s": 1.25, "lmbda": args.lmbda_pd},
+        {"tag": "pd_lp_hi_s125", "mode": "pd",  "lp": args.lp_hi,   "s": 1.25, "lmbda": args.lmbda_pd},
         # Ablation: deterministic cannot reach the SD/PD perception floor.
-        {"tag": "det_lp_hi",     "mode": "det", "lp": 2.0, "s": 1.0,  "lmbda": args.lmbda_det},
+        {"tag": "det_lp_hi",     "mode": "det", "lp": args.lp_hi,   "s": 1.0,  "lmbda": args.lmbda_det},
     ]
 
 
@@ -165,6 +187,10 @@ def decide_gate(table: List[Dict]) -> Dict:
     P1: SD beats PD on perception (SW_2) at matched lambda_p, for >=2 lp values.
     P2: SW_2 monotone non-increasing as lambda_p grows (per mode).
     P3: deterministic with high lambda_p cannot reach SD's perception floor.
+
+    All three criteria are CONDITIONAL on bpp matching within 10%; if that
+    sanity check fails, the SW_2 comparison is comparing apples to oranges
+    and the gate verdict is marked invalid.
     """
     def get(mode, lp):
         for r in table:
@@ -185,8 +211,11 @@ def decide_gate(table: List[Dict]) -> Dict:
         results[f"P2_{mode}_monotone_in_lp"] = ok
         notes.append(f"{mode} sw2 vs lp: {sws}")
 
+    # Find the lp values actually used (after the perc_scale fix the grid
+    # is no longer fixed to {0.5, 2.0}; introspect from the table).
+    lp_values = sorted({r["lmbda_p"] for r in table if r["lmbda_p"] > 0})
     p1_count = 0
-    for lp in (0.5, 2.0):
+    for lp in lp_values:
         sd = get("sd", lp); pd = get("pd", lp)
         if sd is None or pd is None:
             continue
@@ -198,31 +227,52 @@ def decide_gate(table: List[Dict]) -> Dict:
         )
     results["P1_sd_beats_pd_on_perception"] = p1_count >= 2
 
-    det = get("det", 2.0); sd_hi = get("sd", 2.0)
+    # P3 compares det at the highest lp to SD at the highest lp.
+    lp_hi = max(lp_values) if lp_values else None
+    det = get("det", lp_hi) if lp_hi is not None else None
+    sd_hi = get("sd", lp_hi) if lp_hi is not None else None
     if det is not None and sd_hi is not None:
         results["P3_det_cannot_reach_sd_perception"] = (
             det["sw2_patch_mean"] > sd_hi["sw2_patch_mean"] * 1.05
         )
         notes.append(
-            f"P3: det sw2={det['sw2_patch_mean']:.3e} "
+            f"P3 (lp={lp_hi}): det sw2={det['sw2_patch_mean']:.3e} "
             f"vs sd sw2={sd_hi['sw2_patch_mean']:.3e}"
         )
     else:
         results["P3_det_cannot_reach_sd_perception"] = None
 
     # bpp-matched sanity check: SW2 comparison is invalid if rates spread
-    # by more than ~10%. This is methodology, not a kill criterion per se,
-    # but a failed match invalidates P1 and P3.
+    # by more than ~10%. If this fails, P1 and P3 are NOT trustworthy.
     bpps = [r["bpp_mean"] for r in table]
     if bpps:
         bpp_spread = (max(bpps) - min(bpps)) / max(min(bpps), 1e-9)
-        results["bpp_matched_within_10pct"] = bpp_spread < 0.10
+        bpp_ok = bpp_spread < 0.10
+        results["bpp_matched_within_10pct"] = bpp_ok
         notes.append(
             f"bpp spread: min={min(bpps):.4f} max={max(bpps):.4f} "
-            f"rel={bpp_spread:.1%} -> {'OK' if bpp_spread < 0.10 else 'INVALID (retune lmbda_pd / lmbda_det)'}"
+            f"rel={bpp_spread:.1%} -> "
+            f"{'OK' if bpp_ok else 'INVALID (retune lmbda_pd / lmbda_det)'}"
         )
+        if not bpp_ok:
+            # If bpp matching failed, demote P1/P3 to None (invalid) so we
+            # don't draw conclusions from confounded comparisons.
+            results["P1_sd_beats_pd_on_perception"] = None
+            results["P3_det_cannot_reach_sd_perception"] = None
+            notes.append(
+                "P1 and P3 marked invalid: SW_2 comparison requires "
+                "matched bpp. Retune per-mode lmbda and rerun."
+            )
 
-    results["GATE_PASS"] = all(v for v in results.values() if v is not None)
+    # GATE_PASS requires every non-None check to be True. None counts as
+    # "indeterminate", neither passing nor failing the gate.
+    non_none = [v for v in results.values() if v is not None and isinstance(v, bool)]
+    if not non_none:
+        results["GATE_PASS"] = None
+    else:
+        results["GATE_PASS"] = all(non_none) and (
+            results["bpp_matched_within_10pct"] is True
+        )
     results["notes"] = notes
     return results
 
@@ -250,18 +300,31 @@ def parse_args(argv=None):
                    else "runs_gate")
     p.add_argument("--data_root", default=os.environ.get("WALLOC_TRAIN_INPUT"))
     p.add_argument("--test_root", default=os.environ.get("WALLOC_TEST_INPUT"))
-    # training knobs (passed through to scripts/train.py)
-    # Per-mode lmbda: PD and det land at LOWER bpp than SD at the same lmbda
-    # (their entropy models are lighter), so we drop lmbda for them. The
-    # defaults below are calibrated on Kodak from the round-1 gate run
-    # (SD@0.013 -> bpp 0.50, PD@0.013 -> bpp 0.40, det@0.013 -> bpp 0.34);
-    # to land all three near bpp 0.50 we need lmbda_pd ~0.0085 and
-    # lmbda_det ~0.0055. Retune if the bpp-matched check still fails.
+    # ---- training knobs (passed through to scripts/train.py) ----
+    # Per-mode lmbda: PD and det land at LOWER bpp than SD at the same lmbda,
+    # so we RAISE lmbda for them to match SD's ~0.50 bpp anchor. (The
+    # round-1 calibration went the wrong direction; see PATCH NOTES at the
+    # top of this file.) These defaults are first-order estimates; verify
+    # with the first round-2 run and adjust if bpp_spread > 10%.
     p.add_argument("--lmbda",     type=float, default=None,
-                   help="if set, overrides per-mode lmbdas (back-compat)")
-    p.add_argument("--lmbda_sd",  type=float, default=0.013)
-    p.add_argument("--lmbda_pd",  type=float, default=0.0085)
-    p.add_argument("--lmbda_det", type=float, default=0.0055)
+                   help="if set, overrides per-mode lmbdas (back-compat; "
+                        "almost always wrong because bpp won't match)")
+    p.add_argument("--lmbda_sd",  type=float, default=0.013,
+                   help="SD anchor; round-1 result: bpp ~ 0.50")
+    p.add_argument("--lmbda_pd",  type=float, default=0.028,
+                   help="PD; raised from 0.0085 (round-1 bpp 0.28) to "
+                        "target SD's 0.50 bpp")
+    p.add_argument("--lmbda_det", type=float, default=0.050,
+                   help="det; raised from 0.0055 (round-1 bpp 0.16) to "
+                        "target SD's 0.50 bpp")
+    # ---- perception ramp ----
+    # New defaults assume the perc_scale=255**2 fix in LTC/perception.py.
+    # Old grid {0, 0.5, 2.0} is now ~4000x too weak. The new grid puts
+    # perc contribution at ~30% / ~150% of MSE term at lp_lo / lp_hi.
+    p.add_argument("--lp_zero", type=float, default=0.0)
+    p.add_argument("--lp_lo",   type=float, default=0.05)
+    p.add_argument("--lp_hi",   type=float, default=0.2)
+    # ---- other training knobs ----
     p.add_argument("--epochs", type=int, default=12)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--patch_size", type=int, default=256)
@@ -273,7 +336,7 @@ def parse_args(argv=None):
                         "q=4 (N=192) matches --channels 192 default")
     p.add_argument("--num_gpus", type=int,
                    default=_env_int("WALLOC_NUM_GPUS", 0))
-    # orchestration
+    # ---- orchestration ----
     p.add_argument("--runs", default=None,
                    help="comma-separated tags to include (default: all)")
     p.add_argument("--force_retrain", action="store_true")
@@ -308,6 +371,8 @@ def main(argv=None):
         matrix = [c for c in matrix if c["tag"] in wanted]
     print(f"[gate] {len(matrix)} runs planned: {[c['tag'] for c in matrix]}")
     print(f"[gate] lmbda: sd={args.lmbda_sd} pd={args.lmbda_pd} det={args.lmbda_det}")
+    print(f"[gate] lp grid: {args.lp_zero} / {args.lp_lo} / {args.lp_hi} "
+          f"(assumes perc_scale=255**2 in RDPLoss)")
     print(f"[gate] out_root={out_root}")
     print(f"[gate] data_root={args.data_root}")
     print(f"[gate] test_root={args.test_root}")
@@ -335,13 +400,13 @@ def main(argv=None):
     print("\n" + "=" * 72)
     print("GATE TABLE (lower sw2 = better perception; higher psnr = better fidelity)")
     print("=" * 72)
-    hdr = f"{'tag':<18}{'mode':<5}{'lp':>6}{'s':>6}  {'bpp':>7}{'psnr':>8}{'sw2':>11}"
+    hdr = f"{'tag':<18}{'mode':<5}{'lp':>7}{'s':>6}  {'bpp':>7}{'psnr':>8}{'sw2':>11}"
     if any("lpips_mean" in r for r in agg["table"]):
         hdr += f"{'lpips':>9}"
     print(hdr)
     for r in agg["table"]:
         line = (
-            f"{r['tag']:<18}{r['mode']:<5}{r['lmbda_p']:>6.2f}{r['s_dither']:>6.2f}  "
+            f"{r['tag']:<18}{r['mode']:<5}{r['lmbda_p']:>7.3f}{r['s_dither']:>6.2f}  "
             f"{r['bpp_mean']:>7.4f}{r['psnr_mean']:>8.3f}{r['sw2_patch_mean']:>11.3e}"
         )
         if "lpips_mean" in r:
