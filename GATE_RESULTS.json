@@ -1,0 +1,163 @@
+{
+  "matrix": [
+    {
+      "tag": "sd_lp0",
+      "mode": "sd",
+      "lp": 0.0,
+      "s": 1.0,
+      "lmbda": 0.013
+    },
+    {
+      "tag": "sd_lp_lo",
+      "mode": "sd",
+      "lp": 0.03,
+      "s": 1.0,
+      "lmbda": 0.013
+    },
+    {
+      "tag": "sd_lp_hi",
+      "mode": "sd",
+      "lp": 0.1,
+      "s": 1.0,
+      "lmbda": 0.013
+    },
+    {
+      "tag": "pd_lp0_s125",
+      "mode": "pd",
+      "lp": 0.0,
+      "s": 1.25,
+      "lmbda": 0.02
+    },
+    {
+      "tag": "pd_lp_lo_s125",
+      "mode": "pd",
+      "lp": 0.03,
+      "s": 1.25,
+      "lmbda": 0.02
+    },
+    {
+      "tag": "pd_lp_hi_s125",
+      "mode": "pd",
+      "lp": 0.1,
+      "s": 1.25,
+      "lmbda": 0.02
+    },
+    {
+      "tag": "det_lp_hi",
+      "mode": "det",
+      "lp": 0.1,
+      "s": 1.0,
+      "lmbda": 0.038
+    }
+  ],
+  "table": [
+    {
+      "tag": "sd_lp0",
+      "bpp_mean": 0.5032729845261201,
+      "psnr_mean": 33.986065785090126,
+      "mse_mean": 0.0004342877109593246,
+      "sw2_patch_mean": 3.960280719184084e-05,
+      "n_images": 24,
+      "time_s": 13.44378137588501,
+      "mode": "sd",
+      "lmbda": 0.013,
+      "lmbda_p": 0.0,
+      "s_dither": 1.0
+    },
+    {
+      "tag": "sd_lp_lo",
+      "bpp_mean": 0.5066698027415745,
+      "psnr_mean": 33.90564610560735,
+      "mse_mean": 0.0004425658159258698,
+      "sw2_patch_mean": 4.107495677393066e-05,
+      "n_images": 24,
+      "time_s": 13.403341293334961,
+      "mode": "sd",
+      "lmbda": 0.013,
+      "lmbda_p": 0.03,
+      "s_dither": 1.0
+    },
+    {
+      "tag": "sd_lp_hi",
+      "bpp_mean": 0.5120073733802807,
+      "psnr_mean": 33.64832361539205,
+      "mse_mean": 0.00047194501348712947,
+      "sw2_patch_mean": 3.6610787143824077e-05,
+      "n_images": 24,
+      "time_s": 13.291454553604126,
+      "mode": "sd",
+      "lmbda": 0.013,
+      "lmbda_p": 0.1,
+      "s_dither": 1.0
+    },
+    {
+      "tag": "pd_lp0_s125",
+      "bpp_mean": 0.5499846892877637,
+      "psnr_mean": 34.00590022404989,
+      "mse_mean": 0.00042670885219801374,
+      "sw2_patch_mean": 3.6737554106972915e-05,
+      "n_images": 24,
+      "time_s": 13.86739182472229,
+      "mode": "pd",
+      "lmbda": 0.02,
+      "lmbda_p": 0.0,
+      "s_dither": 1.25
+    },
+    {
+      "tag": "pd_lp_lo_s125",
+      "bpp_mean": 0.54193529827171,
+      "psnr_mean": 33.92392257849375,
+      "mse_mean": 0.00043441483527810004,
+      "sw2_patch_mean": 4.7086322107740365e-05,
+      "n_images": 24,
+      "time_s": 14.613738059997559,
+      "mode": "pd",
+      "lmbda": 0.02,
+      "lmbda_p": 0.03,
+      "s_dither": 1.25
+    },
+    {
+      "tag": "pd_lp_hi_s125",
+      "bpp_mean": 0.5381213097910708,
+      "psnr_mean": 33.58697593212128,
+      "mse_mean": 0.0004695075149356853,
+      "sw2_patch_mean": 3.9456253413542676e-05,
+      "n_images": 24,
+      "time_s": 13.324294090270996,
+      "mode": "pd",
+      "lmbda": 0.02,
+      "lmbda_p": 0.1,
+      "s_dither": 1.25
+    },
+    {
+      "tag": "det_lp_hi",
+      "bpp_mean": 0.6187868498576184,
+      "psnr_mean": 35.66093067328135,
+      "mse_mean": 0.0002919804555858718,
+      "sw2_patch_mean": 3.673657533909136e-05,
+      "n_images": 24,
+      "time_s": 14.49130916595459,
+      "mode": "det",
+      "lmbda": 0.038,
+      "lmbda_p": 0.1,
+      "s_dither": 1.0
+    }
+  ],
+  "gate": {
+    "P2_sd_monotone_in_lp": true,
+    "P2_pd_monotone_in_lp": false,
+    "P1_sd_beats_pd_on_perception": null,
+    "P3_det_cannot_reach_sd_perception": null,
+    "bpp_matched_within_10pct": false,
+    "GATE_PASS": false,
+    "notes": [
+      "sd sw2 vs lp: [3.960280719184084e-05, 4.107495677393066e-05, 3.6610787143824077e-05]",
+      "pd sw2 vs lp: [3.6737554106972915e-05, 4.7086322107740365e-05, 3.9456253413542676e-05]",
+      "lp=0.03: SD sw2=4.107e-05 PD sw2=4.709e-05",
+      "lp=0.1: SD sw2=3.661e-05 PD sw2=3.946e-05",
+      "P3 (lp=0.1): det sw2=3.674e-05 vs sd sw2=3.661e-05",
+      "bpp spread: min=0.5033 max=0.6188 rel=23.0% -> INVALID (retune lmbda_pd / lmbda_det)",
+      "P1 and P3 marked invalid: SW_2 comparison requires matched bpp. Retune per-mode lmbda and rerun."
+    ]
+  }
+}

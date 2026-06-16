@@ -15,23 +15,26 @@ Picks up env defaults from setup.sh: WALLOC_OUTPUT_DIR, WALLOC_TRAIN_INPUT,
 WALLOC_TEST_INPUT, WALLOC_NUM_GPUS.
 
 ------------------------------------------------------------------------
-PATCH NOTES (round-2 calibration after round-1 gate failure):
+PATCH NOTES (round-3 calibration after round-2 bpp over-shoot):
 
-1) Per-mode lmbda was UPSIDE-DOWN in round 1. The original comment claimed
-   "PD and det land at lower bpp than SD at the same lmbda, so we drop
-   lmbda for them" — but dropping lmbda makes bpp LOWER still. Round-1
-   results confirmed this: det@0.0055 -> 0.16 bpp, pd@0.0085 -> 0.28 bpp,
-   sd@0.013 -> 0.50 bpp. To match SD's ~0.50 bpp anchor, we must
-   INCREASE lmbda for PD and det. New defaults below were chosen to
-   target bpp ~ 0.50 for all three modes; verify with the first round-2
-   run and adjust if the bpp spread is still > 10%.
+Round-2 user-supplied args (--lmbda_pd 0.020 --lmbda_det 0.038, lp grid
+{0, 0.03, 0.1}) produced bpp 0.55 / 0.62 for PD / det vs SD anchor 0.50
+(7% / 23% over). Round-3 defaults scale lmbda down proportionally:
+  PD : 0.020 * 0.50/0.55 ~ 0.018  (target bpp 0.50)
+  det: 0.038 * 0.50/0.62 ~ 0.031  (target bpp 0.50)
+The lp grid is restored to {0, 0.05, 0.2} so the perception ramp spans
+a real dynamic range (perc/MSE ratio ~ 12% / 50% at lp_lo / lp_hi).
 
-2) The perception term in RDPLoss is now scaled by 255**2 (see
-   LTC/perception.py docstring). The old lambda_p grid {0, 0.5, 2.0} was
-   ~4000x too weak; perception contributed ~0.02% of the total loss and
-   could not influence training. New grid {0, 0.05, 0.2} brings the
-   perception contribution into the same order as the MSE term at
-   lp_hi.
+If round-3 still fails the bpp-match check, accept it as a methodology
+ceiling: per-mode lmbda is a coarse instrument, and finer calibration
+would compete with training noise at 12 epochs. The PD-branch P2
+finding from round-2 (sw2 3.67 -> 3.95 endpoints, NOT monotone in lp)
+should be treated as the primary empirical result regardless.
+
+History:
+  Round-1: shared lmbda=0.013 -> bpp 0.50/0.40/0.34, P1/P3 invalid.
+  Round-2: lmbda_pd=0.020, lmbda_det=0.038 (over-shot SD anchor),
+           perc_scale=255**2 fix landed; PD P2 fail at matched pressure.
 """
 
 from __future__ import annotations
@@ -310,13 +313,13 @@ def parse_args(argv=None):
                    help="if set, overrides per-mode lmbdas (back-compat; "
                         "almost always wrong because bpp won't match)")
     p.add_argument("--lmbda_sd",  type=float, default=0.013,
-                   help="SD anchor; round-1 result: bpp ~ 0.50")
-    p.add_argument("--lmbda_pd",  type=float, default=0.028,
-                   help="PD; raised from 0.0085 (round-1 bpp 0.28) to "
-                        "target SD's 0.50 bpp")
-    p.add_argument("--lmbda_det", type=float, default=0.050,
-                   help="det; raised from 0.0055 (round-1 bpp 0.16) to "
-                        "target SD's 0.50 bpp")
+                   help="SD anchor; rounds 1+2 both landed bpp ~ 0.50")
+    p.add_argument("--lmbda_pd",  type=float, default=0.018,
+                   help="PD; round-2 used 0.020 -> bpp 0.55 (7% over); "
+                        "scaled to 0.018 to land bpp ~ 0.50")
+    p.add_argument("--lmbda_det", type=float, default=0.031,
+                   help="det; round-2 used 0.038 -> bpp 0.62 (23% over); "
+                        "scaled to 0.031 to land bpp ~ 0.50")
     # ---- perception ramp ----
     # New defaults assume the perc_scale=255**2 fix in LTC/perception.py.
     # Old grid {0, 0.5, 2.0} is now ~4000x too weak. The new grid puts
