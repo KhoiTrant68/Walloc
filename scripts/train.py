@@ -110,7 +110,8 @@ def psnr(mse: torch.Tensor) -> torch.Tensor:
 
 
 def train_one_epoch(net, criterion, loader, opt, aux_opt, epoch, clip,
-                    log_every, log_fn, tb: SummaryWriter, global_step: list):
+                    log_every, log_fn, tb: SummaryWriter, global_step: list,
+                    lr_scheduler_per_step=None):
     net.train()
     device = next(net.parameters()).device
     t0 = time.time()
@@ -131,6 +132,8 @@ def train_one_epoch(net, criterion, loader, opt, aux_opt, epoch, clip,
         aux = net.aux_loss()
         aux.backward()
         aux_opt.step()
+        if lr_scheduler_per_step is not None:
+            lr_scheduler_per_step.step()
 
         meters["loss"].update(out["loss"])
         meters["bpp"].update(out["bpp_loss"])
@@ -263,6 +266,15 @@ def parse_args(argv=None):
     p.add_argument("--patch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--aux_lr", type=float, default=1e-3)
+    p.add_argument("--lr_schedule", choices=("plateau", "cosine"),
+                   default="cosine",
+                   help="cosine: deterministic warmup+cosine decay (B1 fix); "
+                        "plateau: legacy ReduceLROnPlateau (sensitive to noisy "
+                        "perception loss, may never trigger)")
+    p.add_argument("--lr_warmup_frac", type=float, default=0.03,
+                   help="fraction of total steps spent in linear warmup")
+    p.add_argument("--lr_min_frac", type=float, default=0.1,
+                   help="cosine decays from lr to lr * lr_min_frac")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--num_gpus", type=int,
@@ -293,7 +305,13 @@ def make_tag(args) -> str:
 
 def main(argv=None):
     args = parse_args(argv)
+    # B3: seed everything torch / numpy / cuda for reproducibility across seeds.
+    import random
+    import numpy as np
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     args.data_root = autodetect_dataset(args.data_root, purpose="train")
     if args.test_root is None:
@@ -419,7 +437,29 @@ def main(argv=None):
         },
     )
     optimizer, aux_opt = opts["net"], opts["aux"]
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=3)
+    # B1: schedule choice. Round-3's pd_lp_hi ran 12 epochs without a single
+    # lr drop because ReduceLROnPlateau couldn't see a plateau through the
+    # noisy perception loss. Cosine schedule fires unconditionally.
+    total_steps = max(1, args.epochs * len(train_loader))
+    if args.lr_schedule == "cosine":
+        warmup_steps = max(1, int(total_steps * args.lr_warmup_frac))
+        cosine_steps = max(1, total_steps - warmup_steps)
+        warmup = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=args.lr_min_frac, end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        cosine = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cosine_steps, eta_min=args.lr * args.lr_min_frac,
+        )
+        lr_scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
+        )
+        lr_step_kind = "per_step"  # call .step() each batch with no args
+    else:
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, "min", patience=3,
+        )
+        lr_step_kind = "per_epoch_loss"  # call .step(loss) each epoch
     criterion = RDPLoss(
         lmbda=args.lmbda, lmbda_p=args.lmbda_p, perc=args.perc,
         patch=args.patch, n_proj=args.n_proj, max_patches=args.max_patches,
@@ -432,7 +472,13 @@ def main(argv=None):
         net.load_state_dict(ck["state_dict"])
         optimizer.load_state_dict(ck["optimizer"])
         aux_opt.load_state_dict(ck["aux_optimizer"])
-        lr_scheduler.load_state_dict(ck["lr_scheduler"])
+        # lr_scheduler resume only works if schedule type matches the saved
+        # checkpoint. Skip on mismatch (cosine vs plateau have different
+        # state shapes); the optimizer state dominates anyway.
+        try:
+            lr_scheduler.load_state_dict(ck["lr_scheduler"])
+        except (KeyError, RuntimeError) as e:
+            print(f"[resume] lr_scheduler reset ({e})")
         print(f"[resume] from epoch {last_epoch} ({args.checkpoint})")
 
     if n_gpus > 1:
@@ -470,9 +516,11 @@ def main(argv=None):
         train_one_epoch(
             net, criterion, train_loader, optimizer, aux_opt, epoch,
             args.clip_max_norm, log_every, log_fn, tb, global_step,
+            lr_scheduler if lr_step_kind == "per_step" else None,
         )
         loss = eval_loop(net, criterion, test_loader, epoch, log_fn, tb)
-        lr_scheduler.step(loss)
+        if lr_step_kind == "per_epoch_loss":
+            lr_scheduler.step(loss)
         history.append(float(loss))
 
         is_best = loss < best_loss

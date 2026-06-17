@@ -15,26 +15,36 @@ Picks up env defaults from setup.sh: WALLOC_OUTPUT_DIR, WALLOC_TRAIN_INPUT,
 WALLOC_TEST_INPUT, WALLOC_NUM_GPUS.
 
 ------------------------------------------------------------------------
-PATCH NOTES (round-3 calibration after round-2 bpp over-shoot):
+PATCH NOTES (round-4 blocker fixes, addresses B1-B4 from review):
 
-Round-2 user-supplied args (--lmbda_pd 0.020 --lmbda_det 0.038, lp grid
-{0, 0.03, 0.1}) produced bpp 0.55 / 0.62 for PD / det vs SD anchor 0.50
-(7% / 23% over). Round-3 defaults scale lmbda down proportionally:
-  PD : 0.020 * 0.50/0.55 ~ 0.018  (target bpp 0.50)
-  det: 0.038 * 0.50/0.62 ~ 0.031  (target bpp 0.50)
-The lp grid is restored to {0, 0.05, 0.2} so the perception ramp spans
-a real dynamic range (perc/MSE ratio ~ 12% / 50% at lp_lo / lp_hi).
+B1 (PD training instability). Round-3 pd_lp_hi ran 12 epochs without
+   the lr scheduler ever firing — ReduceLROnPlateau couldn't see a
+   plateau through the noisy perception loss. The default schedule is
+   now cosine+warmup (deterministic, fires unconditionally). Plumbed
+   through train.py via --lr_schedule.
 
-If round-3 still fails the bpp-match check, accept it as a methodology
-ceiling: per-mode lmbda is a coarse instrument, and finer calibration
-would compete with training noise at 12 epochs. The PD-branch P2
-finding from round-2 (sw2 3.67 -> 3.95 endpoints, NOT monotone in lp)
-should be treated as the primary empirical result regardless.
+B2 (bpp matching). Round-3 spread was 15% (target 10%). Pulling det
+   lmbda further down: 0.031 * 0.504/0.547 ~ 0.028. SD anchor 0.013
+   stays, PD 0.018 stays (its endpoints 0.518 / 0.476 average 0.497 —
+   already on anchor, range is intrinsic perception-bpp dynamics).
+
+B3 (single-seed → 3 seeds). --seeds 0,1,2 expands the matrix; tags get
+   _seed{N} suffix (seed 0 keeps the bare tag for back-compat with
+   existing checkpoints). aggregate() groups by base tag and reports
+   mean ± std. decide_gate consumes the aggregated rows so criteria
+   are evaluated on seed-averaged metrics.
+
+B4 (no external baseline). scripts/baseline_cheng.py runs vanilla
+   cheng2020-attn (q=1..6) on Kodak as a reference R-D curve. HiFiC
+   needs a separate codebase — left as a TODO in baseline_cheng.py.
 
 History:
   Round-1: shared lmbda=0.013 -> bpp 0.50/0.40/0.34, P1/P3 invalid.
-  Round-2: lmbda_pd=0.020, lmbda_det=0.038 (over-shot SD anchor),
-           perc_scale=255**2 fix landed; PD P2 fail at matched pressure.
+  Round-2: lmbda_pd=0.020, lmbda_det=0.038 -> bpp 0.50/0.55/0.62,
+           perc_scale=255**2 fix; PD P2 fail at "matched" pressure.
+  Round-3: lmbda_pd=0.018, lmbda_det=0.031, lp {0,0.05,0.2} -> bpp
+           spread 15%, SD P2 strong (sw2 -54%), PD P2 fail BUT
+           pd_lp_hi never converged (B1 problem).
 """
 
 from __future__ import annotations
@@ -132,6 +142,8 @@ def train_one(cfg, args, out_root: Path) -> Path:
         "--tag", tag,
         "--ntc_quality", str(args.ntc_quality),
         "--num_gpus", str(args.num_gpus),
+        "--lr_schedule", args.lr_schedule,
+        "--seed", str(cfg.get("seed", 0)),
     ]
     if args.data_root:
         cmd += ["--data_root", args.data_root]
@@ -166,22 +178,67 @@ def eval_one(ckpt: Path, args, out_root: Path) -> Path:
 # --------------------------------------------------------------------- #
 
 
+def _strip_seed(tag: str) -> str:
+    # "sd_lp0_seed1" -> "sd_lp0"; "sd_lp0" -> "sd_lp0".
+    import re
+    return re.sub(r"_seed\d+$", "", tag)
+
+
 def aggregate(eval_jsons: List[Path]) -> Dict:
-    table = []
+    """Read per-run eval JSONs; group by base tag (B3) and average over seeds.
+
+    Per-image rows are kept as raw; the gate consumes the averaged table.
+    """
+    import statistics
+
+    per_seed = []
     for j in eval_jsons:
         if not j.exists():
             continue
         with open(j) as f:
             d = json.load(f)
-        row = {"tag": d["tag"]}
+        row = {"tag": d["tag"], "base_tag": _strip_seed(d["tag"])}
         row.update(d["summary"])
         ta = d["train_args"]
         row["mode"] = ta["dither_mode"]
         row["lmbda"] = ta["lmbda"]
         row["lmbda_p"] = ta["lmbda_p"]
         row["s_dither"] = ta["s_dither"]
-        table.append(row)
-    return {"table": table}
+        row["seed"] = ta.get("seed", 0)
+        per_seed.append(row)
+
+    # Group by base_tag, average metrics, record n_seeds + std for the
+    # key columns. metric_keys is the union of numeric summary keys; if a
+    # key isn't present in every seed (e.g. lpips_mean), it's averaged
+    # over the seeds that have it.
+    by_base: Dict[str, List[Dict]] = {}
+    for r in per_seed:
+        by_base.setdefault(r["base_tag"], []).append(r)
+
+    metric_keys = (
+        "bpp_mean", "psnr_mean", "mse_mean", "sw2_patch_mean", "lpips_mean",
+    )
+    table = []
+    for base, rows in by_base.items():
+        ref = rows[0]
+        agg = {
+            "tag": base,
+            "n_seeds": len(rows),
+            "seeds": sorted(r["seed"] for r in rows),
+            "mode": ref["mode"],
+            "lmbda": ref["lmbda"],
+            "lmbda_p": ref["lmbda_p"],
+            "s_dither": ref["s_dither"],
+        }
+        for k in metric_keys:
+            vals = [r[k] for r in rows if k in r]
+            if not vals:
+                continue
+            agg[k] = sum(vals) / len(vals)
+            if len(vals) >= 2:
+                agg[f"{k}_std"] = statistics.stdev(vals)
+        table.append(agg)
+    return {"table": table, "per_seed": per_seed}
 
 
 def decide_gate(table: List[Dict]) -> Dict:
@@ -317,9 +374,20 @@ def parse_args(argv=None):
     p.add_argument("--lmbda_pd",  type=float, default=0.018,
                    help="PD; round-2 used 0.020 -> bpp 0.55 (7% over); "
                         "scaled to 0.018 to land bpp ~ 0.50")
-    p.add_argument("--lmbda_det", type=float, default=0.031,
-                   help="det; round-2 used 0.038 -> bpp 0.62 (23% over); "
-                        "scaled to 0.031 to land bpp ~ 0.50")
+    p.add_argument("--lmbda_det", type=float, default=0.028,
+                   help="det; round-3 used 0.031 -> bpp 0.547 (9% over); "
+                        "scaled to 0.028 to land bpp ~ 0.50")
+    # ---- B1: lr schedule (passed through to train.py) ----
+    p.add_argument("--lr_schedule", choices=("cosine", "plateau"),
+                   default="cosine",
+                   help="cosine: deterministic warmup+cosine decay (fixes "
+                        "the round-3 pd_lp_hi non-convergence); "
+                        "plateau: legacy ReduceLROnPlateau")
+    # ---- B3: multi-seed ----
+    p.add_argument("--seeds", default="0",
+                   help="comma-separated seeds; each config in the matrix "
+                        "is run once per seed. Tags get _seed{N} suffix "
+                        "for seed != 0 (seed 0 keeps the bare tag).")
     # ---- perception ramp ----
     # New defaults assume the perc_scale=255**2 fix in LTC/perception.py.
     # Old grid {0, 0.5, 2.0} is now ~4000x too weak. The new grid puts
@@ -368,14 +436,29 @@ def main(argv=None):
         except FileNotFoundError:
             print("[warn] no test set autodetected; eval will fail if not provided")
 
-    matrix = gate_matrix(args)
+    base_matrix = gate_matrix(args)
     if args.runs:
         wanted = set(s.strip() for s in args.runs.split(","))
-        matrix = [c for c in matrix if c["tag"] in wanted]
-    print(f"[gate] {len(matrix)} runs planned: {[c['tag'] for c in matrix]}")
+        base_matrix = [c for c in base_matrix if c["tag"] in wanted]
+
+    # B3: expand each base config across seeds. seed 0 keeps the bare tag
+    # (back-compat with round-1..3 checkpoints); other seeds get _seedN.
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    matrix = []
+    for cfg in base_matrix:
+        for s in seeds:
+            row = dict(cfg)
+            row["seed"] = s
+            row["base_tag"] = cfg["tag"]
+            row["tag"] = cfg["tag"] if s == 0 else f"{cfg['tag']}_seed{s}"
+            matrix.append(row)
+
+    print(f"[gate] {len(matrix)} runs planned across {len(seeds)} seed(s): "
+          f"{[c['tag'] for c in matrix]}")
     print(f"[gate] lmbda: sd={args.lmbda_sd} pd={args.lmbda_pd} det={args.lmbda_det}")
     print(f"[gate] lp grid: {args.lp_zero} / {args.lp_lo} / {args.lp_hi} "
           f"(assumes perc_scale=255**2 in RDPLoss)")
+    print(f"[gate] lr_schedule={args.lr_schedule} seeds={seeds}")
     print(f"[gate] out_root={out_root}")
     print(f"[gate] data_root={args.data_root}")
     print(f"[gate] test_root={args.test_root}")
@@ -403,18 +486,26 @@ def main(argv=None):
     print("\n" + "=" * 72)
     print("GATE TABLE (lower sw2 = better perception; higher psnr = better fidelity)")
     print("=" * 72)
-    hdr = f"{'tag':<18}{'mode':<5}{'lp':>7}{'s':>6}  {'bpp':>7}{'psnr':>8}{'sw2':>11}"
+    multi_seed = any(r.get("n_seeds", 1) > 1 for r in agg["table"])
+    hdr = f"{'tag':<18}{'mode':<5}{'lp':>7}{'s':>6}{'n':>3}  {'bpp':>7}{'psnr':>8}{'sw2':>11}"
     if any("lpips_mean" in r for r in agg["table"]):
         hdr += f"{'lpips':>9}"
     print(hdr)
     for r in agg["table"]:
+        n = r.get("n_seeds", 1)
         line = (
-            f"{r['tag']:<18}{r['mode']:<5}{r['lmbda_p']:>7.3f}{r['s_dither']:>6.2f}  "
-            f"{r['bpp_mean']:>7.4f}{r['psnr_mean']:>8.3f}{r['sw2_patch_mean']:>11.3e}"
+            f"{r['tag']:<18}{r['mode']:<5}{r['lmbda_p']:>7.3f}{r['s_dither']:>6.2f}"
+            f"{n:>3}  {r['bpp_mean']:>7.4f}{r['psnr_mean']:>8.3f}"
+            f"{r['sw2_patch_mean']:>11.3e}"
         )
         if "lpips_mean" in r:
             line += f"{r['lpips_mean']:>9.4f}"
         print(line)
+        if multi_seed and "sw2_patch_mean_std" in r:
+            print(f"{'  +/- std':<18}{'':<5}{'':<7}{'':<6}{'':<3}  "
+                  f"{r.get('bpp_mean_std', 0):>7.4f}"
+                  f"{r.get('psnr_mean_std', 0):>8.3f}"
+                  f"{r['sw2_patch_mean_std']:>11.3e}")
 
     print("\n" + "=" * 72)
     print("GATE DECISION")
